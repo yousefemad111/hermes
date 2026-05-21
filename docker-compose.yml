@@ -1,11 +1,13 @@
-# docker-compose.yml — Hermes Agent on Coolify (Tailscale + Telegram + Codex OAuth)
-# Fix log:
-#  - python-telegram-bot[webhooks] not in official image (gh#4915) — pip on boot
-#  - Tailscale tag ACL mismatch — joins under user account (no advertise-tags)
-#  - tailscaled hijacks all DNS via 100.100.100.100 — wrap entrypoint to
-#    overwrite /etc/resolv.conf AFTER tailscaled starts so public lookups work
+# docker-compose.yml — Hermes Agent on Coolify (Tailscale + Telegram + Codex)
+# Architecture change: NO shared netns. Both containers on a private Docker
+# network, each with their own DNS. Tailscale Serve proxies cross-container
+# via the user-defined network's DNS.
 
 services:
+  # ─── Tailscale sidecar ─────────────────────────────────────────────────
+  # Joins tailnet as "hermes". TS Serve proxies https://hermes.fox-fish.ts.net
+  # to the hermes container at http://hermes:9119 (resolved via Docker's
+  # user-defined network DNS — both containers can find each other by name).
   hermes-ts:
     image: tailscale/tailscale:latest
     container_name: hermes-ts
@@ -14,37 +16,29 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+    networks:
+      - hermes-net
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SERVE_CONFIG: /config/serve.json
-      TS_ACCEPT_DNS: "false"
+      TS_ACCEPT_DNS: "false"   # don't let TS hijack DNS
     volumes:
       - hermes-ts-state:/var/lib/tailscale
       - ./serve.json:/config/serve.json:ro
-    # Force public DNS *after* containerboot launches tailscaled, by running
-    # a tiny background watcher that rewrites resolv.conf whenever Tailscale
-    # tries to replace it. We can't use docker's `dns:` directive because the
-    # hermes container in shared netns can't see it.
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        (
-          while sleep 5; do
-            grep -q '^nameserver 1\.1\.1\.1' /etc/resolv.conf 2>/dev/null && continue
-            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-          done
-        ) &
-        exec /usr/local/bin/containerboot
 
+  # ─── Hermes Agent ──────────────────────────────────────────────────────
   hermes:
     image: nousresearch/hermes-agent:latest
     container_name: hermes-agent
+    hostname: hermes-agent
     restart: unless-stopped
-    depends_on:
-      - hermes-ts
-    network_mode: service:hermes-ts
+    networks:
+      - hermes-net
+    # Expose dashboard on the user-defined network so the TS sidecar can
+    # proxy to it. NOT published to host — Tailscale handles ingress.
+    expose:
+      - "9119"
     volumes:
       - hermes-data:/opt/data
     environment:
@@ -64,6 +58,10 @@ services:
         limits:
           memory: 1G
           cpus: "1.0"
+
+networks:
+  hermes-net:
+    driver: bridge
 
 volumes:
   hermes-data:
