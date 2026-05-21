@@ -1,51 +1,64 @@
-# docker-compose.yml — Hermes Agent on Coolify
-# Uses the OFFICIAL nousresearch/hermes-agent image (no custom build).
-# Login path: Codex OAuth (ChatGPT subscription) + Telegram gateway.
+# docker-compose.yml — Hermes Agent on Coolify (Tailscale + Telegram + Codex OAuth)
+# Fixes applied:
+#  - python-telegram-bot[webhooks] missing in official image (gh#4915) — pip on boot
+#  - Tailscale tag ACL mismatch — joins under user account (no advertise-tags)
+#  - DNS resolution broken via Tailscale namespace — force explicit resolvers
+#    on the sidecar (the hermes container shares the sidecar's netns).
 
 services:
+  hermes-ts:
+    image: tailscale/tailscale:latest
+    container_name: hermes-ts
+    hostname: hermes
+    restart: unless-stopped
+    # DNS resolvers are inherited by the hermes container (shared netns).
+    # Tailscale's MagicDNS lookups still work; this just handles public names.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      # Stop Tailscale from rewriting /etc/resolv.conf — let our explicit
+      # `dns:` entries above stand.
+      TS_ACCEPT_DNS: "false"
+    volumes:
+      - hermes-ts-state:/var/lib/tailscale
+      - ./serve.json:/config/serve.json:ro
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+
   hermes:
     image: nousresearch/hermes-agent:latest
     container_name: hermes-agent
     restart: unless-stopped
-    command: gateway run
-
-    # All Hermes state — config, OAuth tokens, sessions, memory, skills.
-    # MUST be a named volume (not a bind mount) so Coolify backups work
-    # and the non-root hermes user (UID 10000) inside the image can write.
+    depends_on:
+      - hermes-ts
+    network_mode: service:hermes-ts
     volumes:
       - hermes-data:/opt/data
-
     environment:
-      # Enable the built-in web dashboard so you can manage the agent
-      # from a browser without exec-ing into the container.
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
       HERMES_DASHBOARD_PORT: "9119"
-
-      # Telegram gateway — get the token from @BotFather on Telegram.
-      # Coolify injects the actual value from the Environment Variables tab.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-
-      # NOTE on Codex OAuth:
-      # There is NO env var for Codex auth. Tokens are obtained via an
-      # interactive `hermes auth add openai-codex` flow (see README).
-      # Once completed, they live in the hermes-data volume and survive
-      # restarts and image upgrades.
-
-    ports:
-      # Dashboard — Coolify proxies your Tailscale domain here.
-      - "9119"
-      # Gateway API (optional — only needed if external tools will call
-      # Hermes's OpenAI-compatible endpoint). Leave commented unless needed.
-      # - "8642"
-
-    # Mac mini 8GB — keep Hermes from starving Coolify itself.
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS}
+    command:
+      - bash
+      - -c
+      - |
+        /opt/hermes/.venv/bin/pip install --quiet 'python-telegram-bot[webhooks]' || true
+        exec /opt/hermes/docker/entrypoint.sh gateway run
     deploy:
       resources:
         limits:
-          memory: 2G
-          cpus: "1.5"
+          memory: 1G
+          cpus: "1.0"
 
 volumes:
   hermes-data:
+    driver: local
+  hermes-ts-state:
     driver: local
