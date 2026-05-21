@@ -1,9 +1,9 @@
 # docker-compose.yml — Hermes Agent on Coolify (Tailscale + Telegram + Codex OAuth)
-# Fixes applied:
-#  - python-telegram-bot[webhooks] missing in official image (gh#4915) — pip on boot
+# Fix log:
+#  - python-telegram-bot[webhooks] not in official image (gh#4915) — pip on boot
 #  - Tailscale tag ACL mismatch — joins under user account (no advertise-tags)
-#  - DNS resolution broken via Tailscale namespace — force explicit resolvers
-#    on the sidecar (the hermes container shares the sidecar's netns).
+#  - tailscaled hijacks all DNS via 100.100.100.100 — wrap entrypoint to
+#    overwrite /etc/resolv.conf AFTER tailscaled starts so public lookups work
 
 services:
   hermes-ts:
@@ -11,24 +11,32 @@ services:
     container_name: hermes-ts
     hostname: hermes
     restart: unless-stopped
-    # DNS resolvers are inherited by the hermes container (shared netns).
-    # Tailscale's MagicDNS lookups still work; this just handles public names.
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SERVE_CONFIG: /config/serve.json
-      # Stop Tailscale from rewriting /etc/resolv.conf — let our explicit
-      # `dns:` entries above stand.
       TS_ACCEPT_DNS: "false"
     volumes:
       - hermes-ts-state:/var/lib/tailscale
       - ./serve.json:/config/serve.json:ro
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
+    # Force public DNS *after* containerboot launches tailscaled, by running
+    # a tiny background watcher that rewrites resolv.conf whenever Tailscale
+    # tries to replace it. We can't use docker's `dns:` directive because the
+    # hermes container in shared netns can't see it.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        (
+          while sleep 5; do
+            grep -q '^nameserver 1\.1\.1\.1' /etc/resolv.conf 2>/dev/null && continue
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+          done
+        ) &
+        exec /usr/local/bin/containerboot
 
   hermes:
     image: nousresearch/hermes-agent:latest
